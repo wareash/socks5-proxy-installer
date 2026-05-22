@@ -61,6 +61,52 @@ install_pkg() {
     --no-install-recommends "${pkg}"
 }
 
+compiler_ready() {
+  local probe
+  probe="$(mktemp /tmp/microsocks-probe-XXXXXX 2>/dev/null || echo /tmp/microsocks-probe-$$)"
+  if ! command -v gcc &>/dev/null || [[ ! -f /usr/include/unistd.h ]]; then
+    rm -f "${probe}"
+    return 1
+  fi
+  if printf 'int main(void){return 0;}\n' | gcc -x c - -o "${probe}" 2>/dev/null; then
+    rm -f "${probe}"
+    return 0
+  fi
+  rm -f "${probe}"
+  return 1
+}
+
+install_compiler() {
+  if compiler_ready; then
+    log "编译工具已就绪"
+    return 0
+  fi
+
+  if install_pkg build-essential && compiler_ready; then
+    log "已安装 build-essential"
+    return 0
+  fi
+
+  warn "build-essential 安装失败，尝试最小编译依赖..."
+
+  install_pkg make || err "make 安装失败，请手动修复 apt 依赖后重试"
+  install_pkg libc6-dev || err "libc6-dev 安装失败（缺少 C 头文件 unistd.h）"
+
+  local gcc_pkg=""
+  local candidate
+  for candidate in gcc-10 gcc-11 gcc-12 gcc-9 gcc; do
+    if install_pkg "${candidate}" && compiler_ready; then
+      gcc_pkg="${candidate}"
+      break
+    fi
+  done
+
+  if [[ -z "${gcc_pkg}" ]]; then
+    err "无法安装可用的 C 编译环境。请手动执行: apt-get install -y libc6-dev gcc-10 make"
+  fi
+  log "已安装编译器: ${gcc_pkg}"
+}
+
 install_build_deps() {
   export DEBIAN_FRONTEND=noninteractive
 
@@ -77,15 +123,7 @@ install_build_deps() {
     fi
   done
 
-  if pkg_installed build-essential || { command -v gcc &>/dev/null && command -v make &>/dev/null; }; then
-    log "编译工具已就绪"
-  elif install_pkg build-essential; then
-    log "已安装 build-essential"
-  else
-    warn "build-essential 安装失败，尝试分别安装 gcc / make..."
-    install_pkg gcc || err "gcc 安装失败，请手动修复 apt 依赖后重试"
-    install_pkg make || err "make 安装失败，请手动修复 apt 依赖后重试"
-  fi
+  install_compiler
 
   if ! install_pkg iptables-persistent; then
     warn "iptables-persistent 未安装（重启后 iptables 规则可能丢失，请在云安全组放行端口）"
