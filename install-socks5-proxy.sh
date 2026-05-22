@@ -48,6 +48,50 @@ pick_free_port() {
   err "无法找到可用端口"
 }
 
+pkg_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+install_pkg() {
+  local pkg="$1"
+  if pkg_installed "${pkg}"; then
+    return 0
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    --no-install-recommends "${pkg}"
+}
+
+install_build_deps() {
+  export DEBIAN_FRONTEND=noninteractive
+
+  log "更新软件包索引..."
+  apt-get update -qq 2>&1 | grep -v '^W:' || true
+
+  log "修复 apt 依赖（如有）..."
+  apt-get --fix-broken install -y -qq 2>/dev/null || true
+
+  local essential=(ca-certificates curl git openssl)
+  for pkg in "${essential[@]}"; do
+    if ! install_pkg "${pkg}"; then
+      err "必需包 ${pkg} 安装失败。请手动执行: apt-get --fix-broken install && apt-get install ${pkg}"
+    fi
+  done
+
+  if pkg_installed build-essential || { command -v gcc &>/dev/null && command -v make &>/dev/null; }; then
+    log "编译工具已就绪"
+  elif install_pkg build-essential; then
+    log "已安装 build-essential"
+  else
+    warn "build-essential 安装失败，尝试分别安装 gcc / make..."
+    install_pkg gcc || err "gcc 安装失败，请手动修复 apt 依赖后重试"
+    install_pkg make || err "make 安装失败，请手动修复 apt 依赖后重试"
+  fi
+
+  if ! install_pkg iptables-persistent; then
+    warn "iptables-persistent 未安装（重启后 iptables 规则可能丢失，请在云安全组放行端口）"
+  fi
+}
+
 open_firewall_port() {
   local port="$1"
   if command -v iptables &>/dev/null; then
@@ -75,11 +119,7 @@ if systemctl is-active --quiet microsocks.service 2>/dev/null; then
   pkill -9 microsocks 2>/dev/null || true
 fi
 
-log "安装编译依赖..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq git build-essential curl openssl iptables-persistent 2>/dev/null \
-  || apt-get install -y -qq git build-essential curl openssl
+install_build_deps
 
 log "编译 microsocks..."
 rm -rf "${BUILD_DIR}"
