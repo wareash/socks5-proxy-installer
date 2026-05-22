@@ -3,6 +3,9 @@
 # SOCKS5 代理一键部署脚本 (microsocks)
 # 用法: sudo bash install-socks5-proxy.sh
 #
+# 兼容: Debian 10+, Ubuntu 18.04+
+# 处理: held broken packages, 缺少编译工具等各种异常环境
+#
 set -euo pipefail
 
 RED='\033[0;31m'
@@ -48,27 +51,114 @@ pick_free_port() {
   err "无法找到可用端口"
 }
 
+# ---------------------------------------------------------------------------
+# 依赖安装 - 多层策略
+# ---------------------------------------------------------------------------
+
 pkg_installed() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
 }
 
-install_pkg() {
+# 策略 1: 正常 apt-get install
+try_apt_install() {
   local pkg="$1"
-  if pkg_installed "${pkg}"; then
-    return 0
-  fi
+  pkg_installed "${pkg}" && return 0
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    --no-install-recommends "${pkg}"
+    --no-install-recommends "${pkg}" 2>/dev/null && return 0
+  return 1
+}
+
+# 策略 2: 下载 .deb 后用 dpkg 强制安装（绕过 apt 依赖解析器）
+try_dpkg_force_install() {
+  local pkg="$1"
+  pkg_installed "${pkg}" && return 0
+
+  local tmp_dir="/tmp/dpkg-force-$$"
+  mkdir -p "${tmp_dir}"
+
+  if apt-get download "${pkg}" -o Dir::Cache::Archives="${tmp_dir}" 2>/dev/null; then
+    local deb_file
+    deb_file=$(find "${tmp_dir}" -name "${pkg}*.deb" 2>/dev/null | head -1)
+    if [[ -z "${deb_file}" ]]; then
+      deb_file=$(ls /tmp/dpkg-force-$$/${pkg}*.deb 2>/dev/null | head -1)
+    fi
+    if [[ -z "${deb_file}" ]]; then
+      deb_file=$(ls ./${pkg}*.deb 2>/dev/null | head -1)
+    fi
+    if [[ -n "${deb_file}" ]]; then
+      dpkg --force-depends --force-confdef -i "${deb_file}" 2>/dev/null && {
+        rm -rf "${tmp_dir}" ./${pkg}*.deb
+        return 0
+      }
+    fi
+  fi
+
+  # apt-get download 有时会把文件放在当前目录
+  local deb_file
+  deb_file=$(ls ./${pkg}*.deb 2>/dev/null | head -1)
+  if [[ -n "${deb_file}" ]]; then
+    dpkg --force-depends --force-confdef -i "${deb_file}" 2>/dev/null && {
+      rm -f ./${pkg}*.deb
+      rm -rf "${tmp_dir}"
+      return 0
+    }
+  fi
+
+  rm -rf "${tmp_dir}"
+  return 1
+}
+
+# 策略 3: 从 snapshot.debian.org 直接下载 .deb（完全不依赖本地 apt）
+try_direct_download_install() {
+  local pkg="$1"
+  pkg_installed "${pkg}" && return 0
+
+  local arch
+  arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+
+  # 使用 apt-cache 查找下载 URL
+  local url
+  url=$(apt-cache show "${pkg}" 2>/dev/null | grep -m1 "^Filename:" | awk '{print $2}')
+
+  if [[ -n "${url}" ]]; then
+    # 从 sources.list 中提取 mirror
+    local mirror
+    mirror=$(grep -m1 "^deb http" /etc/apt/sources.list 2>/dev/null | awk '{print $2}' || echo "")
+
+    if [[ -n "${mirror}" ]]; then
+      local full_url="${mirror}/${url}"
+      local deb_file="/tmp/${pkg}_direct_$$.deb"
+
+      if curl -fsSL -o "${deb_file}" "${full_url}" 2>/dev/null \
+         || wget -q -O "${deb_file}" "${full_url}" 2>/dev/null; then
+        dpkg --force-depends --force-confdef -i "${deb_file}" 2>/dev/null && {
+          rm -f "${deb_file}"
+          return 0
+        }
+      fi
+      rm -f "${deb_file}"
+    fi
+  fi
+
+  return 1
+}
+
+# 组合策略: 依次尝试所有方法安装一个包
+ensure_pkg() {
+  local pkg="$1"
+  pkg_installed "${pkg}" && return 0
+  try_apt_install "${pkg}" && return 0
+  try_dpkg_force_install "${pkg}" && return 0
+  try_direct_download_install "${pkg}" && return 0
+  return 1
 }
 
 compiler_ready() {
-  local probe
-  probe="$(mktemp /tmp/microsocks-probe-XXXXXX 2>/dev/null || echo /tmp/microsocks-probe-$$)"
-  if ! command -v gcc &>/dev/null || [[ ! -f /usr/include/unistd.h ]]; then
-    rm -f "${probe}"
-    return 1
-  fi
-  if printf 'int main(void){return 0;}\n' | gcc -x c - -o "${probe}" 2>/dev/null; then
+  command -v gcc &>/dev/null || return 1
+  command -v make &>/dev/null || return 1
+
+  local probe="/tmp/microsocks-probe-$$"
+  if printf '#include <unistd.h>\nint main(void){return 0;}\n' | gcc -x c - -o "${probe}" 2>/dev/null; then
     rm -f "${probe}"
     return 0
   fi
@@ -76,59 +166,166 @@ compiler_ready() {
   return 1
 }
 
-install_compiler() {
+install_build_deps() {
+  export DEBIAN_FRONTEND=noninteractive
+
+  log "修复 dpkg 状态..."
+  dpkg --configure -a 2>/dev/null || true
+
+  log "解除 held 包..."
+  local held_pkgs
+  held_pkgs=$(apt-mark showhold 2>/dev/null || true)
+  if [[ -n "${held_pkgs}" ]]; then
+    echo "${held_pkgs}" | xargs apt-mark unhold 2>/dev/null || true
+    log "已解除: ${held_pkgs}"
+  fi
+
+  log "更新软件包索引..."
+  apt-get update -qq 2>&1 | grep -v '^W:' || true
+
+  log "修复 apt 依赖..."
+  apt-get --fix-broken install -y 2>/dev/null || true
+
+  # 基础工具
+  local basic_ok=true
+  for pkg in ca-certificates curl git openssl; do
+    if ! ensure_pkg "${pkg}"; then
+      # curl/git/openssl 可能已预装（通过 PATH 可用即可）
+      if ! command -v "${pkg}" &>/dev/null; then
+        warn "${pkg} 安装失败"
+        basic_ok=false
+      fi
+    fi
+  done
+
+  if ! command -v git &>/dev/null; then
+    err "git 不可用。请手动安装 git 后重试。"
+  fi
+  if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+    err "curl/wget 均不可用。请手动安装后重试。"
+  fi
+
+  # 编译工具
   if compiler_ready; then
     log "编译工具已就绪"
     return 0
   fi
 
-  if install_pkg build-essential && compiler_ready; then
+  log "安装编译工具..."
+
+  # 尝试 build-essential（一步到位）
+  if ensure_pkg build-essential && compiler_ready; then
     log "已安装 build-essential"
     return 0
   fi
 
-  warn "build-essential 安装失败，尝试最小编译依赖..."
+  # 分步安装
+  log "逐步安装编译依赖..."
+  ensure_pkg make || true
+  if ! command -v make &>/dev/null; then
+    err "make 安装失败，请手动执行: dpkg --configure -a && apt-get install -y make"
+  fi
 
-  install_pkg make || err "make 安装失败，请手动修复 apt 依赖后重试"
-  install_pkg libc6-dev || err "libc6-dev 安装失败（缺少 C 头文件 unistd.h）"
+  # libc6-dev 提供 C 头文件（unistd.h 等）
+  ensure_pkg libc6-dev || ensure_pkg libc-dev || true
 
-  local gcc_pkg=""
-  local candidate
-  for candidate in gcc-10 gcc-11 gcc-12 gcc-9 gcc; do
-    if install_pkg "${candidate}" && compiler_ready; then
-      gcc_pkg="${candidate}"
+  # gcc: 尝试多个版本
+  local gcc_installed=false
+  for candidate in gcc-10 gcc-12 gcc-11 gcc-9 gcc-8 gcc; do
+    if ensure_pkg "${candidate}"; then
+      gcc_installed=true
+      # 确保 /usr/bin/gcc 存在
+      if ! command -v gcc &>/dev/null; then
+        local real_gcc
+        real_gcc=$(command -v "${candidate}" 2>/dev/null || find /usr/bin -name "${candidate}*" -type f 2>/dev/null | head -1)
+        if [[ -n "${real_gcc}" ]]; then
+          ln -sf "${real_gcc}" /usr/bin/gcc
+        fi
+      fi
       break
     fi
   done
 
-  if [[ -z "${gcc_pkg}" ]]; then
-    err "无法安装可用的 C 编译环境。请手动执行: apt-get install -y libc6-dev gcc-10 make"
+  if ! "${gcc_installed}"; then
+    err "无法安装 gcc。请手动执行: dpkg --configure -a && apt-get install -y gcc libc6-dev make"
   fi
-  log "已安装编译器: ${gcc_pkg}"
+
+  # linux-libc-dev 提供某些内核头文件
+  ensure_pkg linux-libc-dev 2>/dev/null || true
+
+  # 最终验证
+  if compiler_ready; then
+    log "编译环境已就绪"
+    return 0
+  fi
+
+  # 最后一搏: 检查缺什么
+  if ! printf '#include <unistd.h>\nint main(void){return 0;}\n' | gcc -x c - -o /dev/null 2>/tmp/gcc-err-$$; then
+    local gcc_error
+    gcc_error=$(cat /tmp/gcc-err-$$ 2>/dev/null || echo "unknown")
+    rm -f /tmp/gcc-err-$$
+    err "编译器测试失败: ${gcc_error}\n请手动执行: apt-get install -y gcc libc6-dev make"
+  fi
 }
 
-install_build_deps() {
-  export DEBIAN_FRONTEND=noninteractive
+# ---------------------------------------------------------------------------
+# 获取 microsocks 二进制 - 编译 或 下载预编译
+# ---------------------------------------------------------------------------
 
-  log "更新软件包索引..."
-  apt-get update -qq 2>&1 | grep -v '^W:' || true
+MICROSOCKS_BIN="/usr/local/bin/microsocks"
 
-  log "修复 apt 依赖（如有）..."
-  apt-get --fix-broken install -y -qq 2>/dev/null || true
-
-  local essential=(ca-certificates curl git openssl)
-  for pkg in "${essential[@]}"; do
-    if ! install_pkg "${pkg}"; then
-      err "必需包 ${pkg} 安装失败。请手动执行: apt-get --fix-broken install && apt-get install ${pkg}"
+get_microsocks() {
+  # 方案 1: 从源码编译
+  if compiler_ready; then
+    log "编译 microsocks..."
+    rm -rf "${BUILD_DIR}"
+    git clone --depth 1 "${MICROSOCKS_REPO}" "${BUILD_DIR}"
+    if make -C "${BUILD_DIR}" -s 2>/dev/null; then
+      install -m 755 "${BUILD_DIR}/microsocks" "${MICROSOCKS_BIN}"
+      log "microsocks 编译安装完成"
+      return 0
     fi
-  done
-
-  install_compiler
-
-  if ! install_pkg iptables-persistent; then
-    warn "iptables-persistent 未安装（重启后 iptables 规则可能丢失，请在云安全组放行端口）"
+    warn "编译失败，尝试下载预编译二进制..."
   fi
+
+  # 方案 2: 下载预编译静态二进制
+  download_prebuilt
 }
+
+download_prebuilt() {
+  local arch
+  arch=$(uname -m)
+  local binary_url=""
+
+  case "${arch}" in
+    x86_64|amd64)
+      binary_url="https://github.com/wareash/socks5-proxy-installer/releases/download/v1.0/microsocks-linux-amd64"
+      ;;
+    aarch64|arm64)
+      binary_url="https://github.com/wareash/socks5-proxy-installer/releases/download/v1.0/microsocks-linux-arm64"
+      ;;
+    *)
+      err "不支持的架构: ${arch}，且编译失败。请手动修复编译环境后重试。"
+      ;;
+  esac
+
+  log "下载预编译 microsocks (${arch})..."
+  if curl -fsSL -o "${MICROSOCKS_BIN}" "${binary_url}" 2>/dev/null \
+     || wget -q -O "${MICROSOCKS_BIN}" "${binary_url}" 2>/dev/null; then
+    chmod 755 "${MICROSOCKS_BIN}"
+    # 验证二进制可执行
+    if "${MICROSOCKS_BIN}" --help &>/dev/null || true; then
+      log "预编译 microsocks 下载完成"
+      return 0
+    fi
+  fi
+
+  err "无法下载预编译 microsocks，且编译环境不可用。\n请手动修复: dpkg --configure -a && apt-get install -y gcc libc6-dev make git"
+}
+
+# ---------------------------------------------------------------------------
+# 防火墙
+# ---------------------------------------------------------------------------
 
 open_firewall_port() {
   local port="$1"
@@ -149,7 +346,16 @@ open_firewall_port() {
   else
     warn "未检测到 iptables/ufw，请自行在云安全组放行端口 ${port}"
   fi
+
+  # 可选: iptables-persistent
+  if ! pkg_installed iptables-persistent; then
+    ensure_pkg iptables-persistent 2>/dev/null || true
+  fi
 }
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
 
 if systemctl is-active --quiet microsocks.service 2>/dev/null; then
   warn "检测到已有 microsocks 服务，将重新部署并生成新凭据"
@@ -158,12 +364,12 @@ if systemctl is-active --quiet microsocks.service 2>/dev/null; then
 fi
 
 install_build_deps
+get_microsocks
 
-log "编译 microsocks..."
-rm -rf "${BUILD_DIR}"
-git clone --depth 1 "${MICROSOCKS_REPO}" "${BUILD_DIR}"
-make -C "${BUILD_DIR}" -s
-install -m 755 "${BUILD_DIR}/microsocks" /usr/local/bin/microsocks
+# 验证 microsocks 可用
+if [[ ! -x "${MICROSOCKS_BIN}" ]]; then
+  err "microsocks 安装失败"
+fi
 
 PORT=$(pick_free_port)
 USER=$(openssl rand -hex 8)
