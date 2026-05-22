@@ -13,7 +13,7 @@
 ## 使用方法
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/socks5-proxy-installer/main/install-socks5-proxy.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/wareash/socks5-proxy-installer/main/install-socks5-proxy.sh | sudo bash
 ```
 
 或直接下载后运行：
