@@ -23,7 +23,9 @@ fi
 
 CREDS_FILE="/etc/microsocks/credentials.env"
 INFO_FILE="${HOME}/socks5-proxy-info.txt"
-[[ -n "${SUDO_USER:-}" && "${HOME}" == "/root" ]] && INFO_FILE="/home/${SUDO_USER}/socks5-proxy-info.txt"
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" && -d "/home/${SUDO_USER}" ]]; then
+  INFO_FILE="/home/${SUDO_USER}/socks5-proxy-info.txt"
+fi
 BUILD_DIR="/tmp/microsocks-build-$$"
 MICROSOCKS_REPO="https://github.com/rofl0r/microsocks.git"
 
